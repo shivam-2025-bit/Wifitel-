@@ -1,0 +1,73 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "User account information and presence status",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "emoji": { "type": "string" },
+        "friendId": { "type": "string", "description": "Public identifier like PREFIX-XXXX" },
+        "online": { "type": "boolean" },
+        "unreadCount": { "type": "number" },
+        "lastSeen": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "emoji", "friendId"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "A single chat message",
+      "type": "object",
+      "properties": {
+        "senderId": { "type": "string" },
+        "text": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["senderId", "text", "timestamp"]
+    },
+    "Call": {
+      "title": "Call Session",
+      "description": "WebRTC signaling data for a call",
+      "type": "object",
+      "properties": {
+        "callerId": { "type": "string" },
+        "receiverId": { "type": "string" },
+        "status": { "type": "string", "enum": ["ringing", "active", "ended"] },
+        "type": { "type": "string", "enum": ["audio", "video"] },
+        "offer": { "type": "object", "description": "RTCSessionDescription" },
+        "answer": { "type": "object", "description": "RTCSessionDescription" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "FriendRequest": {
+      "title": "Friend Request",
+      "description": "Pending invitation between users",
+      "type": "object",
+      "properties": {
+        "fromId": { "type": "string" },
+        "fromName": { "type": "string" },
+        "fromEmoji": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "accepted", "rejected"] },
+        "timestamp": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Global user profiles"
+    },
+    "/chats/{chatId}/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Chat message history"
+    },
+    "/calls/{callId}": {
+      "schema": "Call",
+      "description": "Active call signaling"
+    },
+    "/users/{userId}/notifications/{notifId}": {
+      "schema": "FriendRequest",
+      "description": "Inbound friend requests"
+    }
+  }
+}

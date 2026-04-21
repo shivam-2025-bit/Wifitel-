@@ -1,0 +1,6 @@
+{
+  "name": "Wifitel",
+  "description": "A high-performance WebRTC video calling and messaging app with real-time chat and friend management.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": []
+}
