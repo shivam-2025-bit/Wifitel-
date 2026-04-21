@@ -1,0 +1,34 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "users": {
+      ".read": "auth != null",
+      ".indexOn": ["friendId"],
+      "$uid": {
+        ".write": "auth != null && auth.uid === $uid",
+        "notifications": {
+          "$notifId": {
+            ".write": "auth != null"
+          }
+        }
+      }
+    },
+    "chats": {
+      "$chatId": {
+        ".read": "auth != null && $chatId.contains(auth.uid)",
+        "messages": {
+          ".indexOn": ["timestamp"],
+          "$messageId": {
+            ".write": "auth != null && $chatId.contains(auth.uid)"
+          }
+        }
+      }
+    },
+    "calls": {
+      ".read": "auth != null",
+      ".write": "auth != null",
+      ".indexOn": ["receiverId"]
+    }
+  }
+}

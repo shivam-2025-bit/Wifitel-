@@ -1,0 +1,97 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helper Functions ---
+    function isSignedIn() { return request.auth != null; }
+    function isOwner(userId) { return isSignedIn() && request.auth.uid == userId; }
+    function isVerifiedEmail() { return isSignedIn() && request.auth.token.email_verified == true; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    
+    // --- Collection Rules ---
+
+    // Users
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.name is string && data.name.size() >= 1 && data.name.size() <= 50
+           && data.emoji is string && data.emoji.size() <= 2
+           && data.friendId is string && data.friendId.size() <= 20 && data.friendId.matches('^[A-Z0-9_\\-]+$')
+           && data.online is boolean
+           && data.unreadCount is number
+           && (data.get('lastSeen', '') is string);
+      }
+
+      allow get: if isSignedIn();
+      allow list: if isSignedIn(); // Allow listing users to find friends
+      
+      allow create: if isOwner(userId) && isValidUser(incoming()) 
+                     && incoming().unreadCount == 0;
+      
+      allow update: if isOwner(userId) && isValidUser(incoming()) && (
+        // Action: Update Profile
+        (incoming().diff(existing()).affectedKeys().hasOnly(['name', 'emoji', 'online', 'lastSeen'])) ||
+        // Action: Reset Unread
+        (incoming().diff(existing()).affectedKeys().hasOnly(['unreadCount']) && incoming().unreadCount == 0)
+      );
+
+      // Notifications (Friend Requests)
+      match /notifications/{notifId} {
+        function isValidNotif(data) {
+          return data.fromId is string && isValidId(data.fromId)
+             && data.fromName is string && data.fromName.size() <= 50
+             && data.status in ['pending', 'accepted', 'rejected'];
+        }
+        
+        allow read: if isOwner(userId);
+        allow create: if isSignedIn() && isValidNotif(incoming()) && incoming().status == 'pending';
+        allow update: if isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['status']);
+        allow delete: if isOwner(userId);
+      }
+    }
+
+    // Chats
+    match /chats/{chatId} {
+      // chatId usually looks like uid1_uid2
+      function isParticipant() {
+        return isSignedIn() && chatId.contains(request.auth.uid);
+      }
+
+      allow get: if isParticipant();
+      
+      match /messages/{messageId} {
+        function isValidMessage(data) {
+          return data.senderId == request.auth.uid 
+             && data.text is string && data.text.size() <= 1000;
+        }
+        
+        allow read: if isParticipant();
+        allow create: if isParticipant() && isValidMessage(incoming());
+      }
+    }
+
+    // Calls
+    match /calls/{callId} {
+      function isCallParticipant(data) {
+        return isSignedIn() && (data.callerId == request.auth.uid || data.receiverId == request.auth.uid);
+      }
+
+      allow get: if isSignedIn() && isCallParticipant(existing());
+      allow create: if isSignedIn() && isCallParticipant(incoming()) 
+                    && incoming().status == 'ringing';
+      
+      allow update: if isSignedIn() && isCallParticipant(existing()) && (
+        // Action: Answer or End
+        incoming().diff(existing()).affectedKeys().hasAny(['status', 'answer', 'offer'])
+      );
+      allow delete: if isCallParticipant(existing());
+    }
+  }
+}

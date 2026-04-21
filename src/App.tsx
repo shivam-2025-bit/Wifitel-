@@ -21,26 +21,30 @@ import {
   GoogleAuthProvider, 
   signOut, 
   onAuthStateChanged,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  updateProfile,
   User as FirebaseUser
 } from 'firebase/auth';
 import { 
-  doc, 
-  setDoc, 
-  getDoc, 
-  onSnapshot, 
-  collection, 
-  query, 
-  orderBy, 
-  limit, 
-  addDoc, 
-  Timestamp,
-  updateDoc,
-  deleteDoc,
-  arrayUnion,
-  where
-} from 'firebase/firestore';
+  ref, 
+  set, 
+  onValue, 
+  push, 
+  update, 
+  remove, 
+  get, 
+  child,
+  serverTimestamp,
+  off,
+  onChildAdded,
+  query as rdbQuery,
+  orderByChild,
+  equalTo,
+  limitToLast
+} from 'firebase/database';
 
-import { auth, db } from './lib/firebase';
+import { auth, db, firebaseConfig } from './lib/firebase';
 import { rtcConfig } from './lib/webrtc';
 
 import { Button } from '@/components/ui/button';
@@ -95,6 +99,14 @@ interface CallHistory {
 export default function App() {
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [profile, setProfile] = useState<any>(null);
+  const [profileLoading, setProfileLoading] = useState(true);
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [isSignIn, setIsSignIn] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [dbConnected, setDbConnected] = useState<boolean | null>(null);
   const [view, setView] = useState<'dashboard' | 'chat'>('dashboard');
   const [activeChat, setActiveChat] = useState<ChatContact | null>(null);
   const [activeCall, setActiveCall] = useState<any>(null);
@@ -113,30 +125,49 @@ export default function App() {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
 
+  // --- RTDB Connection Check ---
+  useEffect(() => {
+    const connectedRef = ref(db, ".info/connected");
+    return onValue(connectedRef, (snap) => {
+      setDbConnected(snap.val() === true);
+    });
+  }, []);
+
   // --- Auth & Profile ---
   useEffect(() => {
     return onAuthStateChanged(auth, async (u) => {
-      setUser(u);
-      if (u) {
-        // Fetch or Create Profile
-        const userRef = doc(db, 'users', u.uid);
-        const snap = await getDoc(userRef);
-        if (snap.exists()) {
-          setProfile(snap.data());
+      setLoginError(null);
+      try {
+        setUser(u);
+        if (u) {
+          setProfileLoading(true);
+          const userRef = ref(db, `users/${u.uid}`);
+          const snap = await get(userRef);
+          
+          if (snap.exists()) {
+            setProfile(snap.val());
+          } else {
+            const newId = `WT-${Math.random().toString(36).substring(7).toUpperCase()}`;
+            const newProfile = {
+              name: u.displayName || displayName || u.email?.split('@')[0] || 'User',
+              emoji: '📱',
+              friendId: newId,
+              online: true,
+              unreadCount: 0,
+              lastSeen: new Date().toISOString()
+            };
+            await set(userRef, newProfile);
+            setProfile(newProfile);
+          }
+          await update(userRef, { online: true });
         } else {
-          const newId = `WT-${Math.random().toString(36).substring(7).toUpperCase()}`;
-          const newProfile = {
-            name: u.displayName || 'Unset',
-            emoji: '📱',
-            friendId: newId,
-            online: true,
-            unreadCount: 0,
-            lastSeen: new Date().toISOString()
-          };
-          await setDoc(userRef, newProfile);
-          setProfile(newProfile);
+          setProfile(null);
         }
-        updateDoc(userRef, { online: true });
+      } catch (err: any) {
+        console.error("Profile sync error:", err);
+        setLoginError(`Profile Sync Error: ${err.message}. Please verify your Database URL and Rules.`);
+      } finally {
+        setProfileLoading(false);
       }
     });
   }, []);
@@ -144,32 +175,36 @@ export default function App() {
   // Set offline on disconnect
   useEffect(() => {
     if (!user) return;
+    const userRef = ref(db, `users/${user.uid}`);
     const handleVisibility = () => {
       if (document.visibilityState === 'hidden') {
-        updateDoc(doc(db, 'users', user.uid), { online: false });
+        update(userRef, { online: false });
       } else {
-        updateDoc(doc(db, 'users', user.uid), { online: true });
+        update(userRef, { online: true });
       }
     };
     document.addEventListener('visibilitychange', handleVisibility);
-    return () => document.removeEventListener('visibilitychange', handleVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      update(userRef, { online: false });
+    };
   }, [user]);
 
   // --- Signaling Listener (Calls) ---
   useEffect(() => {
     if (!user) return;
-    const callRef = collection(db, 'calls');
-    const q = query(callRef, where('receiverId', '==', user.uid), where('status', '==', 'ringing'));
+    const callsRef = ref(db, 'calls');
+    const q = rdbQuery(callsRef, orderByChild('receiverId'), equalTo(user.uid));
     
-    return onSnapshot(q, (snap) => {
-      snap.docChanges().forEach(async (change) => {
-        if (change.type === 'added') {
-          const callData = { id: change.doc.id, ...change.doc.data() };
-          setActiveCall(callData);
-          setIsCalling(true);
-        }
-      });
+    const listener = onChildAdded(q, (snapshot) => {
+      const callData = snapshot.val();
+      if (callData.status === 'ringing') {
+        setActiveCall({ id: snapshot.key, ...callData });
+        setIsCalling(true);
+      }
     });
+
+    return () => off(callsRef, 'child_added', listener);
   }, [user]);
 
   // --- Friend Requests & Contacts Listeners ---
@@ -177,27 +212,42 @@ export default function App() {
     if (!user) return;
     
     // Notifications (Friend Requests)
-    const notifRef = collection(db, 'users', user.uid, 'notifications');
-    const unsubNotif = onSnapshot(notifRef, (snap) => {
-      const reqs = snap.docs.map(d => ({ id: d.id, ...d.data() } as FriendRequest));
-      setFriendRequests(reqs.filter(r => r.status === 'pending'));
-      setNotificationsCount(reqs.filter(r => r.status === 'pending').length);
+    const notifRef = ref(db, `users/${user.uid}/notifications`);
+    const unsubNotif = onValue(notifRef, (snapshot) => {
+      const data = snapshot.val();
+      if (!data) {
+        setFriendRequests([]);
+        setNotificationsCount(0);
+        return;
+      }
+      const reqs = Object.entries(data).map(([id, val]: any) => ({ id: id, ...val } as FriendRequest));
+      const pending = reqs.filter(r => r.status === 'pending');
+      setFriendRequests(pending);
+      setNotificationsCount(pending.length);
     });
 
-    // Mock Call History (or fetch from real history)
-    setCallHistory([
-      { id: '1', type: 'incoming', contactName: 'Alex', timestamp: '2h ago', duration: '5:20' },
-      { id: '2', type: 'missed', contactName: 'Sarah', timestamp: 'Yesterday', duration: '0:00' }
-    ]);
+    // Real Friends / Contacts Listener
+    const usersRef = ref(db, 'users');
+    const unsubContacts = onValue(usersRef, (snapshot) => {
+      const data = snapshot.val();
+      if (!data) return;
+      const allUsers = Object.entries(data)
+        .map(([id, val]: any) => ({ id, ...val } as any))
+        .filter(u => u.id !== user.uid) // Don't show self
+        .map(u => ({
+          id: u.id,
+          name: u.name,
+          emoji: u.emoji || '👤',
+          online: u.online || false,
+          unreadCount: u.unreadCount || 0
+        } as ChatContact));
+      setContacts(allUsers);
+    });
 
-    // Contacts (Simplified: anyone you have a chat history with or friends)
-    // For this demo, let's auto-populate some if empty or fetch users
-    setContacts([
-      { id: 'dev-1', name: 'Wifitel Support', emoji: '🧑‍💻', online: true, unreadCount: 0 },
-      { id: 'demo-2', name: 'Community Bot', emoji: '🤖', online: false, unreadCount: 2 }
-    ]);
-
-    return () => unsubNotif();
+    return () => {
+      off(notifRef);
+      off(usersRef);
+    };
   }, [user]);
 
   // --- WebRTC Core Functions ---
@@ -223,7 +273,9 @@ export default function App() {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
-    const callDoc = await addDoc(collection(db, 'calls'), {
+    const callsRef = ref(db, 'calls');
+    const newCallRef = push(callsRef);
+    await set(newCallRef, {
       callerId: user.uid,
       callerName: profile.name,
       callerEmoji: profile.emoji,
@@ -231,15 +283,15 @@ export default function App() {
       status: 'ringing',
       type,
       offer: { sdp: offer.sdp, type: offer.type },
-      createdAt: Timestamp.now()
+      createdAt: serverTimestamp()
     });
 
-    setActiveCall({ id: callDoc.id, type, callerId: user.uid, receiverId: targetId });
+    setActiveCall({ id: newCallRef.key, type, callerId: user.uid, receiverId: targetId });
     setIsCalling(true);
 
     // Listen for answer
-    onSnapshot(callDoc, async (snap) => {
-      const data = snap.data();
+    onValue(newCallRef, async (snapshot) => {
+      const data = snapshot.val();
       if (data?.answer && !pc.currentRemoteDescription) {
         await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
       }
@@ -251,7 +303,8 @@ export default function App() {
     // Handle ICE Candidates
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        addDoc(collection(db, 'calls', callDoc.id, 'candidates'), {
+        const candRef = ref(db, `calls/${newCallRef.key}/candidates`);
+        push(candRef, {
           ...event.candidate.toJSON(),
           type: 'caller'
         });
@@ -259,15 +312,12 @@ export default function App() {
     };
 
     // Listen for remote ICE candidates
-    onSnapshot(collection(db, 'calls', callDoc.id, 'candidates'), (snap) => {
-      snap.docChanges().forEach(async (change) => {
-        if (change.type === 'added') {
-          const cand = change.doc.data();
-          if (cand.type === 'receiver') {
-            await pc.addIceCandidate(new RTCIceCandidate(cand));
-          }
-        }
-      });
+    const candRef = ref(db, `calls/${newCallRef.key}/candidates`);
+    onChildAdded(candRef, async (snapshot) => {
+      const cand = snapshot.val();
+      if (cand.type === 'receiver') {
+        await pc.addIceCandidate(new RTCIceCandidate(cand));
+      }
     });
   };
 
@@ -297,7 +347,8 @@ export default function App() {
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
 
-    await updateDoc(doc(db, 'calls', activeCall.id), {
+    const callRef = ref(db, `calls/${activeCall.id}`);
+    await update(callRef, {
       answer: { sdp: answer.sdp, type: answer.type },
       status: 'active'
     });
@@ -305,7 +356,8 @@ export default function App() {
     // Handle ICE Candidates
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        addDoc(collection(db, 'calls', activeCall.id, 'candidates'), {
+        const candRef = ref(db, `calls/${activeCall.id}/candidates`);
+        push(candRef, {
           ...event.candidate.toJSON(),
           type: 'receiver'
         });
@@ -313,26 +365,24 @@ export default function App() {
     };
 
     // Listen for caller ICE candidates
-    onSnapshot(collection(db, 'calls', activeCall.id, 'candidates'), (snap) => {
-      snap.docChanges().forEach(async (change) => {
-        if (change.type === 'added') {
-          const cand = change.doc.data();
-          if (cand.type === 'caller') {
-            await pc.addIceCandidate(new RTCIceCandidate(cand));
-          }
-        }
-      });
+    const candRef = ref(db, `calls/${activeCall.id}/candidates`);
+    onChildAdded(candRef, async (snapshot) => {
+      const cand = snapshot.val();
+      if (cand.type === 'caller') {
+        await pc.addIceCandidate(new RTCIceCandidate(cand));
+      }
     });
 
     // Listen for call end
-    onSnapshot(doc(db, 'calls', activeCall.id), (snap) => {
-      if (snap.data()?.status === 'ended') endCall();
+    onValue(callRef, (snapshot) => {
+      if (snapshot.val()?.status === 'ended') endCall();
     });
   };
 
   const endCall = async () => {
     if (activeCall?.id) {
-      await updateDoc(doc(db, 'calls', activeCall.id), { status: 'ended' });
+      const callRef = ref(db, `calls/${activeCall.id}`);
+      await update(callRef, { status: 'ended' });
     }
     pcRef.current?.close();
     localStreamRef.current?.getTracks().forEach(t => t.stop());
@@ -340,43 +390,288 @@ export default function App() {
     setActiveCall(null);
   };
 
+  // --- Messaging Listener ---
+  useEffect(() => {
+    if (!user || !activeChat) {
+      setMessages([]);
+      return;
+    }
+
+    const chatId = [user.uid, activeChat.id].sort().join('_');
+    const msgRef = ref(db, `chats/${chatId}/messages`);
+    const q = rdbQuery(msgRef, limitToLast(50));
+
+    const unsub = onValue(q, (snapshot) => {
+      const data = snapshot.val();
+      if (!data) {
+        setMessages([]);
+        return;
+      }
+      const msgs = Object.entries(data).map(([id, val]: any) => ({ id: id, ...val } as Message));
+      setMessages(msgs.sort((a, b) => a.timestamp - b.timestamp));
+    });
+
+    // Clear unread count when opening chat
+    const userRef = ref(db, `users/${user.uid}`);
+    update(userRef, { unreadCount: 0 });
+
+    return () => off(q);
+  }, [user, activeChat]);
+
   // --- Messaging Logic ---
   const sendMessage = async (text: string) => {
     if (!user || !activeChat || !text.trim()) return;
     const chatId = [user.uid, activeChat.id].sort().join('_');
-    const msgRef = collection(db, 'chats', chatId, 'messages');
+    const msgRef = ref(db, `chats/${chatId}/messages`);
     
-    await addDoc(msgRef, {
+    await push(msgRef, {
       senderId: user.uid,
       text,
-      timestamp: Timestamp.now()
+      timestamp: serverTimestamp()
     });
 
     // Increment unread count for partner
-    const partnerRef = doc(db, 'users', activeChat.id);
-    updateDoc(partnerRef, { unreadCount: (activeChat.unreadCount || 0) + 1 });
+    const partnerRef = ref(db, `users/${activeChat.id}`);
+    update(partnerRef, { unreadCount: (activeChat.unreadCount || 0) + 1 });
+  };
+
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email || !password) return;
+    if (!isSignIn && !displayName.trim()) {
+      setLoginError("Please enter your name.");
+      return;
+    }
+    setLoading(true);
+    setLoginError(null);
+    try {
+      if (isSignIn) {
+        await signInWithEmailAndPassword(auth, email, password);
+      } else {
+        const userCred = await createUserWithEmailAndPassword(auth, email, password);
+        // Initial profile update for new email users
+        await updateProfile(userCred.user, {
+          displayName: displayName.trim()
+        });
+      }
+    } catch (error: any) {
+      console.error(error);
+      if (error.code === 'auth/operation-not-allowed') {
+        setLoginError('Email/Password provider is disabled. Enable it in Firebase Console > Authentication > Sign-in method.');
+      } else if (error.code === 'auth/weak-password') {
+        setLoginError('Password should be at least 6 characters.');
+      } else if (error.code === 'auth/email-already-in-use') {
+        setLoginError('This email is already in use.');
+      } else if (error.code === 'auth/invalid-credential') {
+        setLoginError('Invalid email or password.');
+      } else {
+        setLoginError(error.message);
+      }
+    } finally {
+      setLoading(false);
+    }
   };
 
   // --- Handlers ---
-  const handleLogin = () => signInWithPopup(auth, new GoogleAuthProvider());
+  const handleLogin = async () => {
+    try {
+      setLoginError(null);
+      await signInWithPopup(auth, new GoogleAuthProvider());
+    } catch (error: any) {
+      console.error(error);
+      if (error.code === 'auth/operation-not-allowed') {
+        setLoginError('Google Login is not enabled in your Firebase Console.');
+      } else if (error.code === 'auth/popup-blocked') {
+        setLoginError('Popup was blocked by your browser.');
+      } else {
+        setLoginError(error.message);
+      }
+    }
+  };
   const handleLogout = () => signOut(auth);
+
+  const sendFriendRequest = async (targetFriendId: string) => {
+    if (!user || !profile || !targetFriendId.trim()) return;
+    try {
+      const usersRef = ref(db, 'users');
+      const q = rdbQuery(usersRef, orderByChild('friendId'), equalTo(targetFriendId.trim().toUpperCase()));
+      const snap = await get(q);
+      
+      if (snap.exists()) {
+        const targetUid = Object.keys(snap.val())[0];
+        const notifRef = ref(db, `users/${targetUid}/notifications`);
+        await push(notifRef, {
+          fromId: user.uid,
+          fromName: profile.name,
+          fromEmoji: profile.emoji,
+          status: 'pending',
+          timestamp: serverTimestamp()
+        });
+        alert(`Request sent to ${snap.val()[targetUid].name}!`);
+      } else {
+        alert("User ID not found. Tip: Ask your friend for their WT-XXXX ID.");
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const acceptFriendRequest = async (requestId: string) => {
+    if (!user) return;
+    const reqRef = ref(db, `users/${user.uid}/notifications/${requestId}`);
+    await update(reqRef, { status: 'accepted' });
+  };
+
+  if (profileLoading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-[#F5F5F7]">
+        <div className="flex flex-col items-center gap-4">
+          <motion.div 
+            animate={{ rotate: 360 }} 
+            transition={{ repeat: Infinity, duration: 1, ease: "linear" }}
+            className="w-12 h-12 border-4 border-slate-200 border-t-blue-600 rounded-full"
+          />
+          <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest animate-pulse">Establishing Secure Link...</p>
+          
+          <div className="mt-8">
+            <Button 
+               variant="ghost" 
+               className="text-[10px] font-bold text-slate-300 hover:text-red-500 uppercase tracking-[0.2em]"
+               onClick={() => {
+                 signOut(auth);
+                 window.location.reload();
+               }}
+            >
+              Reset Session
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (!user) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen bg-slate-50 p-6">
+      <div className="flex flex-col items-center justify-center min-h-screen bg-[#F5F5F7] p-6 font-sans">
         <motion.div 
           initial={{ scale: 0.9, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}
-          className="text-center"
+          className="text-center bg-white p-10 rounded-[32px] shadow-2xl border border-slate-100 max-w-sm w-full"
         >
-          <div className="w-24 h-24 bg-blue-600 rounded-3xl flex items-center justify-center mb-6 mx-auto shadow-xl">
+          <div className="w-24 h-24 bg-blue-600 rounded-3xl flex items-center justify-center mb-8 mx-auto shadow-xl shadow-blue-500/20">
             <Activity className="text-white w-12 h-12" />
           </div>
-          <h1 className="text-4xl font-bold text-slate-900 mb-2 font-sans tracking-tight">Wifitel</h1>
-          <p className="text-slate-500 mb-8 max-w-xs mx-auto">High-performance video calling and secure real-time messaging.</p>
-          <Button onClick={handleLogin} className="w-full bg-blue-600 hover:bg-blue-700 h-12 text-lg rounded-xl">
+          <h1 className="text-4xl font-black text-slate-900 mb-2 tracking-tight">Wifitel</h1>
+          <p className="text-slate-500 mb-8 text-sm font-medium leading-relaxed uppercase tracking-wider">Secure Video Calling</p>
+          
+          {dbConnected === false && (
+             <div className="bg-red-50 border border-red-200 text-red-700 text-[10px] py-3 px-4 rounded-xl mb-6 font-bold flex flex-col gap-1 items-start text-left">
+                <span className="flex items-center gap-1">🚫 <span className="uppercase tracking-widest">Database Offline</span></span>
+                <p className="font-medium normal-case leading-relaxed">Could not connect to Firebase Realtime Database. Please check your <b>databaseURL</b> in the configuration.</p>
+             </div>
+          )}
+
+          {firebaseConfig.appId.length < 20 && (
+             <div className="bg-amber-50 border border-amber-200 text-amber-700 text-[10px] py-3 px-4 rounded-xl mb-6 font-bold flex flex-col gap-1 items-start text-left">
+                <span className="flex items-center gap-1">⚠️ <span className="uppercase tracking-widest">Configuration Warning</span></span>
+                <p className="font-medium normal-case leading-relaxed">Your <b>appId</b> looks too short or incomplete. Please check your Firebase settings.</p>
+             </div>
+          )}
+
+          <form onSubmit={handleEmailAuth} className="space-y-4 mb-6">
+            <div className="space-y-2">
+              {!isSignIn && (
+                <Input 
+                  type="text" 
+                  placeholder="Full Name" 
+                  value={displayName}
+                  onChange={e => setDisplayName(e.target.value)}
+                  className="h-12 rounded-xl bg-slate-50 border-slate-200 focus:bg-white transition-all px-4 font-medium"
+                  required
+                />
+              )}
+              <Input 
+                type="email" 
+                placeholder="Email Address" 
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+                className="h-12 rounded-xl bg-slate-50 border-slate-200 focus:bg-white transition-all px-4 font-medium"
+                required
+              />
+              <Input 
+                type="password" 
+                placeholder="Password" 
+                value={password}
+                onChange={e => setPassword(e.target.value)}
+                className="h-12 rounded-xl bg-slate-50 border-slate-200 focus:bg-white transition-all px-4 font-medium"
+                required
+              />
+            </div>
+            
+            <Button 
+              type="submit"
+              disabled={loading}
+              className="w-full bg-blue-600 hover:bg-blue-700 h-12 text-sm font-bold rounded-xl shadow-md shadow-blue-500/20 transition-all active:scale-[0.98]"
+            >
+              {loading ? (
+                <span className="flex items-center gap-2">
+                  <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></span>
+                  Processing...
+                </span>
+              ) : (
+                isSignIn ? 'Sign In with Email' : 'Create Account'
+              )}
+            </Button>
+            
+            <button 
+              type="button"
+              onClick={() => setIsSignIn(!isSignIn)}
+              className="text-xs font-bold text-slate-400 hover:text-blue-600 uppercase tracking-widest transition-colors"
+            >
+              {isSignIn ? "Don't have an account? Sign up" : "Already have an account? Sign in"}
+            </button>
+          </form>
+
+          <div className="flex items-center gap-4 mb-6">
+            <div className="h-px bg-slate-100 flex-1"></div>
+            <span className="text-[10px] font-black text-slate-300 uppercase tracking-[0.2em]">OR</span>
+            <div className="h-px bg-slate-100 flex-1"></div>
+          </div>
+
+          <Button 
+            onClick={handleLogin} 
+            variant="outline"
+            className="w-full border-slate-200 hover:bg-slate-50 h-12 text-sm font-bold rounded-xl transition-all shadow-sm mb-4 flex items-center justify-center gap-3"
+          >
+            <div className="w-5 h-5 flex items-center justify-center">
+               <svg viewBox="0 0 24 24" width="18" height="18" xmlns="http://www.w3.org/2000/svg"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+            </div>
             Sign in with Google
           </Button>
+
+          {loginError && (
+             <div className="bg-red-50 border border-red-100 text-red-600 text-[11px] py-3 px-4 rounded-xl mb-6 font-bold flex items-center gap-2">
+                <span className="text-sm">⚠️</span> {loginError}
+             </div>
+          )}
+
+          <div className="pt-6 border-t border-slate-100 mt-4 text-left">
+             <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4 text-center italic">Action Required</h3>
+             <ul className="space-y-4">
+                <li className="flex gap-3 text-xs text-slate-600 font-medium leading-normal bg-slate-50 p-3 rounded-xl border border-slate-100">
+                   <span className="w-5 h-5 bg-blue-600 text-white rounded-full flex items-center justify-center text-[10px] shrink-0">1</span>
+                   <span><b>Enable Providers:</b> In Firebase Console &gt; Auth &gt; Sign-in method, enable <b>Email/Password</b> and <b>Google</b>.</span>
+                </li>
+                <li className="flex gap-3 text-xs text-slate-600 font-medium leading-normal bg-slate-50 p-3 rounded-xl border border-slate-100">
+                   <span className="w-5 h-5 bg-blue-600 text-white rounded-full flex items-center justify-center text-[10px] shrink-0">2</span>
+                   <span><b>Add Authorized Domain:</b> In Authentication &gt; Settings, add <code>{window.location.hostname}</code></span>
+                </li>
+                <li className="flex gap-3 text-xs text-slate-600 font-medium leading-normal bg-slate-50 p-3 rounded-xl border border-slate-100">
+                   <span className="w-5 h-5 bg-blue-600 text-white rounded-full flex items-center justify-center text-[10px] shrink-0">3</span>
+                   <span><b>New Tab:</b> If still failing, click the icon in the top right to open in a new tab.</span>
+                </li>
+             </ul>
+          </div>
         </motion.div>
       </div>
     );
@@ -398,14 +693,15 @@ export default function App() {
         </div>
 
         {/* Search / Add Friend */}
-        <div className="px-4 py-2">
-          <div className="flex items-center bg-slate-100 rounded-xl px-3 py-2.5 border border-transparent focus-within:border-blue-300 transition-all">
+        <div className="px-4 py-2 flex items-center gap-2">
+          <div className="flex-1 flex items-center bg-slate-100 rounded-xl px-3 py-2.5 border border-transparent focus-within:border-blue-300 transition-all">
             <Plus className="text-slate-400 w-4 h-4 mr-2" />
             <Input 
               placeholder="Look up ID (wt-XXXX)" 
               className="bg-transparent border-none outline-none text-sm w-full h-auto p-0 focus-visible:ring-0" 
             />
           </div>
+          <AddFriendDialog onAdd={sendFriendRequest} />
         </div>
 
         {/* Tabs and Navigation */}
@@ -536,40 +832,60 @@ export default function App() {
               </header>
 
               <ScrollArea className="flex-1 px-8 py-8 bg-[#F8F9FB]">
-                <div className="max-w-2xl mx-auto space-y-6">
+                <div className="max-w-2xl mx-auto space-y-4">
                   {/* Date Separator */}
-                  <div className="flex justify-center">
-                    <span className="px-4 py-1.5 bg-slate-200/50 text-slate-500 text-[10px] font-bold rounded-full uppercase tracking-widest">Today</span>
+                  <div className="flex justify-center mb-4">
+                    <span className="px-4 py-1.5 bg-slate-200/50 text-slate-500 text-[10px] font-bold rounded-full uppercase tracking-widest">Chat Session Started</span>
                   </div>
 
-                  <div className="flex justify-start items-end gap-3">
-                    <Avatar className="w-8 h-8 mb-1">
-                      <AvatarFallback className="bg-slate-200 text-[10px] font-bold">{activeChat.emoji}</AvatarFallback>
-                    </Avatar>
-                    <div className="bg-white p-4 rounded-2xl rounded-bl-none max-w-[70%] shadow-sm text-sm border border-slate-100 font-medium text-slate-700 leading-relaxed overflow-hidden">
-                      Hello! Welcome to Wifitel. I am the support bot here to help you. Did you check our latest update? 🚀
+                  {messages.length === 0 ? (
+                    <div className="text-center py-20 text-slate-300">
+                      <MessageSquare className="w-12 h-12 mx-auto mb-4 opacity-20" />
+                      <p className="text-xs font-bold uppercase tracking-[0.2em] italic">No messages yet</p>
                     </div>
-                  </div>
-
-                  <div className="flex justify-end items-end gap-3">
-                    <div className="bg-blue-600 text-white p-4 rounded-2xl rounded-br-none max-w-[70%] shadow-lg shadow-blue-500/10 text-sm font-medium leading-relaxed overflow-hidden">
-                      The WebRTC quality is amazing! The latency is very low.
-                    </div>
-                  </div>
+                  ) : (
+                    messages.map((msg, i) => (
+                      <div key={msg.id || i} className={`flex ${msg.senderId === user.uid ? 'justify-end' : 'justify-start'} items-end gap-3`}>
+                        {msg.senderId !== user.uid && (
+                          <Avatar className="w-8 h-8 mb-1 shadow-sm border border-white">
+                            <AvatarFallback className="bg-slate-200 text-[10px] font-bold">{activeChat.emoji}</AvatarFallback>
+                          </Avatar>
+                        )}
+                        <div className={`p-4 rounded-2xl max-w-[75%] shadow-sm text-sm leading-relaxed overflow-hidden ${
+                          msg.senderId === user.uid 
+                            ? 'bg-blue-600 text-white rounded-br-none font-medium' 
+                            : 'bg-white text-slate-700 rounded-bl-none font-medium border border-slate-100'
+                        }`}>
+                          {msg.text}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                  <div ref={(el) => el?.scrollIntoView({ behavior: 'smooth' })} />
                 </div>
               </ScrollArea>
 
               <div className="p-6 bg-white border-t border-slate-100 flex items-center justify-center">
-                 <div className="max-w-2xl w-full flex gap-3 p-2 bg-slate-100 rounded-2xl border border-slate-200 focus-within:border-blue-300 focus-within:bg-white transition-all shadow-sm">
-                   <Button variant="ghost" size="icon" className="text-slate-400 rounded-xl"><Plus className="w-5 h-5" /></Button>
+                 <form 
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const input = e.currentTarget.elements.namedItem('msg') as HTMLInputElement;
+                    sendMessage(input.value);
+                    input.value = '';
+                  }}
+                  className="max-w-2xl w-full flex gap-3 p-2 bg-slate-100 rounded-2xl border border-slate-200 focus-within:border-blue-300 focus-within:bg-white transition-all shadow-sm"
+                 >
+                   <Button type="button" variant="ghost" size="icon" className="text-slate-400 rounded-xl"><Plus className="w-5 h-5" /></Button>
                    <Input 
+                    name="msg"
+                    autoComplete="off"
                     placeholder="Type a message..." 
-                    className="bg-transparent border-none outline-none focus-visible:ring-0 text-slate-700 font-medium h-12" 
+                    className="bg-transparent border-none outline-none focus-visible:ring-0 text-slate-700 font-medium h-12 p-0 px-2" 
                    />
-                   <Button className="bg-blue-600 hover:bg-blue-700 w-12 h-12 rounded-xl p-0 shadow-md shadow-blue-500/20 shrink-0">
+                   <Button type="submit" className="bg-blue-600 hover:bg-blue-700 w-12 h-12 rounded-xl p-0 shadow-md shadow-blue-500/20 shrink-0">
                      <Send className="w-5 h-5" />
                    </Button>
-                 </div>
+                 </form>
               </div>
             </motion.div>
           ) : (
@@ -719,12 +1035,14 @@ function ProfileDialog({ profile, onLogout }: any) {
   );
 }
 
-function AddFriendDialog() {
+function AddFriendDialog({ onAdd }: { onAdd: (id: string) => void }) {
   const [friendId, setFriendId] = useState('');
   return (
     <Dialog>
       <DialogTrigger asChild>
-        <Button variant="ghost" size="icon"><Plus className="w-5 h-5 text-slate-500" /></Button>
+        <Button variant="ghost" size="icon" className="shrink-0 bg-slate-100 rounded-xl w-10 h-10 flex items-center justify-center hover:bg-slate-200">
+          <UserPlus className="w-5 h-5 text-slate-500" />
+        </Button>
       </DialogTrigger>
       <DialogContent className="max-w-xs rounded-3xl">
         <DialogHeader>
@@ -732,15 +1050,15 @@ function AddFriendDialog() {
         </DialogHeader>
         <div className="space-y-4 py-4">
           <Input 
-            placeholder="[PREFIX]-XXXX" 
+            placeholder="WT-XXXX" 
             value={friendId}
             onChange={e => setFriendId(e.target.value)}
             className="rounded-xl border-slate-200"
           />
-          <p className="text-[10px] text-slate-400 px-1">Ask your friend for their unique WT ID.</p>
+          <p className="text-[10px] text-slate-400 px-1 font-medium leading-relaxed uppercase tracking-widest">Ask your friend for their unique WT ID.</p>
         </div>
         <DialogFooter>
-           <Button className="w-full bg-blue-600 rounded-xl gap-2">
+           <Button onClick={() => { onAdd(friendId); setFriendId(''); }} className="w-full bg-blue-600 rounded-xl gap-2 h-12 font-bold shadow-lg shadow-blue-500/20">
              <UserPlus className="w-4 h-4" /> Send Request
            </Button>
         </DialogFooter>
